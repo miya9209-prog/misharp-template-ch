@@ -654,9 +654,9 @@ def top_header():
         .tiny-muted {{font-size: 12px; color: #777;}}
         .stTabs [data-baseweb="tab-list"] {{gap: 8px;}}
         .stTabs [data-baseweb="tab"] {{height: 48px; white-space: pre-wrap; background: #f5f5f5; border-radius: 12px; padding: 8px 18px;}}
-        .template-card {background:#fff; border:1px solid #e9e9e9; border-radius:20px; padding:14px; box-shadow:0 4px 18px rgba(0,0,0,0.04); height:100%;}
-        .template-meta {font-size:12px; color:#666; margin-top:4px;}
-        .pill {display:inline-block; background:#f2f2f2; border-radius:999px; padding:4px 10px; font-size:11px; margin-right:6px; margin-top:6px;}
+        .template-card {{background:#fff; border:1px solid #e9e9e9; border-radius:20px; padding:14px; box-shadow:0 4px 18px rgba(0,0,0,0.04); height:100%;}}
+        .template-meta {{font-size:12px; color:#666; margin-top:4px;}}
+        .pill {{display:inline-block; background:#f2f2f2; border-radius:999px; padding:4px 10px; font-size:11px; margin-right:6px; margin-top:6px;}}
         </style>
         <div class="misharp-title">{APP_TITLE}</div>
         <div class="misharp-sub">{APP_SUBTITLE}</div>
