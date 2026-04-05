@@ -8,7 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import cv2
+try:
+    import cv2
+    CV2_OK = True
+except Exception:
+    cv2 = None
+    CV2_OK = False
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageColor, ImageDraw, ImageFont
@@ -181,6 +186,77 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> Lis
 
 
 # ---------- AI recommendation ----------
+def _clamp_box(x, y, bw, bh, w, h):
+    x = max(0, min(int(x), w - 1))
+    y = max(0, min(int(y), h - 1))
+    bw = max(1, min(int(bw), w - x))
+    bh = max(1, min(int(bh), h - y))
+    return x, y, bw, bh
+
+
+def _fallback_suggest_regions(pil_img: Image.Image) -> Dict[str, List[Dict]]:
+    """Non-cv2 fallback using brightness-change density across rows/cols."""
+    img = np.array(pil_img.convert('L'))
+    h, w = img.shape[:2]
+    row_change = np.mean(np.abs(np.diff(img.astype(np.int16), axis=1)), axis=1)
+    col_change = np.mean(np.abs(np.diff(img.astype(np.int16), axis=0)), axis=0)
+
+    def smooth(arr, k):
+        k = max(3, int(k) | 1)
+        pad = k // 2
+        arr2 = np.pad(arr, (pad, pad), mode='edge')
+        return np.convolve(arr2, np.ones(k)/k, mode='valid')
+
+    row_s = smooth(row_change, max(9, h // 40))
+    col_s = smooth(col_change, max(9, w // 40))
+    row_thr = float(np.percentile(row_s, 65)) if len(row_s) else 0
+    col_thr = float(np.percentile(col_s, 65)) if len(col_s) else 0
+
+    active_rows = np.where(row_s >= row_thr)[0]
+    active_cols = np.where(col_s >= col_thr)[0]
+
+    text_boxes = []
+    if len(active_rows):
+        top_band = active_rows[active_rows < int(h * 0.28)]
+        if len(top_band):
+            y1 = max(0, int(top_band.min()) - int(h * 0.02))
+            y2 = min(h, int(top_band.max()) + int(h * 0.03))
+            text_boxes.append((int(w * 0.08), y1, int(w * 0.84), max(int(h * 0.06), y2 - y1)))
+
+        lower_band = active_rows[(active_rows > int(h * 0.62)) & (active_rows < int(h * 0.95))]
+        if len(lower_band):
+            y1 = max(0, int(lower_band.min()) - int(h * 0.015))
+            y2 = min(h, int(lower_band.max()) + int(h * 0.02))
+            text_boxes.append((int(w * 0.10), y1, int(w * 0.80), max(int(h * 0.05), y2 - y1)))
+
+    image_boxes = []
+    if len(active_cols) and len(active_rows):
+        x1 = max(0, int(np.percentile(active_cols, 10)) - int(w * 0.03))
+        x2 = min(w, int(np.percentile(active_cols, 90)) + int(w * 0.03))
+        y1 = int(h * 0.17)
+        y2 = int(h * 0.62)
+        image_boxes.append((x1, y1, max(int(w * 0.45), x2 - x1), max(int(h * 0.24), y2 - y1)))
+    else:
+        image_boxes.append((int(w * 0.06), int(h * 0.18), int(w * 0.88), int(h * 0.42)))
+
+    text_suggestions = []
+    for idx, (x, y, bw, bh) in enumerate(text_boxes[:6], start=1):
+        x, y, bw, bh = _clamp_box(x, y, bw, bh, w, h)
+        text_suggestions.append({
+            'id': f'text_{idx}', 'label': f'카피 {idx}', 'type': 'text',
+            'x': x, 'y': y, 'w': bw, 'h': bh,
+            'font_size': max(22, min(58, int(bh * 0.42))), 'font_color': '#111111' if y > h * 0.35 else '#FFFFFF',
+            'align': 'center', 'default_text': f'카피 {idx} 입력', 'line_spacing': 8,
+        })
+    image_suggestions = []
+    for idx, (x, y, bw, bh) in enumerate(image_boxes[:6], start=1):
+        x, y, bw, bh = _clamp_box(x, y, bw, bh, w, h)
+        image_suggestions.append({
+            'id': f'image_{idx}', 'label': f'이미지 {idx}', 'type': 'image',
+            'x': x, 'y': y, 'w': bw, 'h': bh, 'placeholder_rgb': [235, 235, 235],
+        })
+    return {'text_boxes': text_suggestions, 'image_slots': image_suggestions}
+
 def _merge_boxes(boxes: List[Tuple[int, int, int, int]], iou_threshold: float = 0.15) -> List[Tuple[int, int, int, int]]:
     if not boxes:
         return []
@@ -214,106 +290,115 @@ def _merge_boxes(boxes: List[Tuple[int, int, int, int]], iou_threshold: float = 
 
 
 def suggest_regions(pil_img: Image.Image) -> Dict[str, List[Dict]]:
-    """Heuristic block detector for image/text candidates."""
-    img = np.array(pil_img.convert("RGB"))
+    """Higher-precision block detector with cv2 when available; safe fallback otherwise."""
+    if not CV2_OK:
+        return _fallback_suggest_regions(pil_img)
+
+    img = np.array(pil_img.convert('RGB'))
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # Text-like regions: blackhat + threshold + dilation
-    rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 7))
+    # 1) text candidates from blackhat + morphology
+    rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 36), max(5, h // 120)))
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rect_kernel)
     grad_x = cv2.Sobel(blackhat, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
     grad_x = np.absolute(grad_x)
-    min_val, max_val = grad_x.min(), grad_x.max()
-    if max_val > min_val:
-        grad_x = 255 * ((grad_x - min_val) / (max_val - min_val))
-    grad_x = grad_x.astype("uint8")
+    if grad_x.max() > grad_x.min():
+        grad_x = 255 * ((grad_x - grad_x.min()) / (grad_x.max() - grad_x.min()))
+    grad_x = grad_x.astype('uint8')
     grad_x = cv2.GaussianBlur(grad_x, (5, 5), 0)
     _, thresh = cv2.threshold(grad_x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    sq_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 10))
-    text_mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, sq_kernel)
+    text_mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 45), max(8, h // 90))))
     text_mask = cv2.dilate(text_mask, np.ones((3, 3), np.uint8), iterations=1)
     contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     text_boxes = []
     for c in contours:
         x, y, bw, bh = cv2.boundingRect(c)
         area = bw * bh
-        if area < w * h * 0.008:
-            continue
-        if bw < w * 0.15 or bh < h * 0.03:
+        if area < w * h * 0.004 or bw < w * 0.12 or bh < h * 0.025:
             continue
         aspect = bw / max(bh, 1)
-        if aspect < 1.5:
+        if aspect < 1.4:
+            continue
+        density = np.mean(text_mask[y:y+bh, x:x+bw] > 0)
+        if density < 0.10:
             continue
         text_boxes.append((x, y, bw, bh))
-    text_boxes = _merge_boxes(text_boxes)
+    text_boxes = _merge_boxes(text_boxes, iou_threshold=0.12)
 
-    # Image-like regions: edges -> contours -> large rectangles
+    # 2) image candidates from low-text, large, edge-bounded regions
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 60, 160)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    edges = cv2.Canny(blurred, 50, 150)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w // 90), max(9, h // 90))), iterations=2)
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     image_boxes = []
     for c in contours:
         x, y, bw, bh = cv2.boundingRect(c)
         area = bw * bh
-        if area < w * h * 0.02:
-            continue
-        if bw < w * 0.18 or bh < h * 0.12:
+        if area < w * h * 0.018 or bw < w * 0.18 or bh < h * 0.10:
             continue
         aspect = bw / max(bh, 1)
-        if aspect < 0.4 or aspect > 3.8:
+        if aspect < 0.35 or aspect > 4.5:
             continue
-        # skip if mostly covered by a text box
+        roi = gray[y:y+bh, x:x+bw]
+        if roi.size == 0:
+            continue
+        stdv = float(np.std(roi))
+        if stdv < 10:
+            continue
         overlap = False
         for tx, ty, tw, th in text_boxes:
-            xx1 = max(x, tx)
-            yy1 = max(y, ty)
-            xx2 = min(x + bw, tx + tw)
-            yy2 = min(y + bh, ty + th)
-            inter = max(0, xx2 - xx1) * max(0, yy2 - yy1)
-            if inter / area > 0.35:
+            xx1, yy1 = max(x, tx), max(y, ty)
+            xx2, yy2 = min(x+bw, tx+tw), min(y+bh, ty+th)
+            inter = max(0, xx2-xx1) * max(0, yy2-yy1)
+            if inter / area > 0.28:
                 overlap = True
                 break
         if not overlap:
             image_boxes.append((x, y, bw, bh))
-    image_boxes = _merge_boxes(image_boxes)
+    image_boxes = _merge_boxes(image_boxes, iou_threshold=0.18)
 
-    # fallback structural presets for upper-detail-page composition
-    if len(text_boxes) == 0 and len(image_boxes) == 0:
+    # 3) whitespace-aware structural priors for detail-page top sections
+    row_mean = gray.mean(axis=1)
+    row_var = gray.var(axis=1)
+    bright = row_mean > np.percentile(row_mean, 60)
+    calm = row_var < np.percentile(row_var, 55)
+    white_rows = np.where(bright & calm)[0]
+    if len(white_rows):
+        top_rows = white_rows[white_rows < int(h * 0.24)]
+        if len(top_rows):
+            y1 = max(0, int(top_rows.min()) - int(h * 0.015))
+            y2 = min(h, int(top_rows.max()) + int(h * 0.02))
+            candidate = (int(w * 0.08), y1, int(w * 0.84), max(int(h * 0.06), y2 - y1))
+            text_boxes.append(candidate)
+    text_boxes = _merge_boxes(text_boxes, iou_threshold=0.18)
+
+    if not image_boxes:
+        image_boxes = [(int(w * 0.06), int(h * 0.18), int(w * 0.88), int(h * 0.42))]
+    if not text_boxes:
         text_boxes = [
-            (int(w * 0.08), int(h * 0.06), int(w * 0.84), int(h * 0.10)),
-            (int(w * 0.12), int(h * 0.72), int(w * 0.76), int(h * 0.10)),
+            (int(w * 0.08), int(h * 0.06), int(w * 0.84), int(h * 0.09)),
+            (int(w * 0.12), int(h * 0.72), int(w * 0.76), int(h * 0.08)),
         ]
-        image_boxes = [(int(w * 0.06), int(h * 0.18), int(w * 0.88), int(h * 0.48))]
 
     text_suggestions = []
     for idx, (x, y, bw, bh) in enumerate(sorted(text_boxes, key=lambda b: (b[1], b[0]))[:6], start=1):
-        font_size = max(22, min(64, int(bh * 0.42)))
+        x, y, bw, bh = _clamp_box(x, y, bw, bh, w, h)
         text_suggestions.append({
-            "id": f"text_{idx}",
-            "label": f"카피 {idx}",
-            "type": "text",
-            "x": int(x), "y": int(y), "w": int(bw), "h": int(bh),
-            "font_size": font_size,
-            "font_color": "#111111" if y > h * 0.35 else "#FFFFFF",
-            "align": "center",
-            "default_text": f"카피 {idx} 입력",
-            "line_spacing": 8,
+            'id': f'text_{idx}', 'label': f'카피 {idx}', 'type': 'text',
+            'x': x, 'y': y, 'w': bw, 'h': bh,
+            'font_size': max(22, min(64, int(bh * 0.42))),
+            'font_color': '#111111' if y > h * 0.35 else '#FFFFFF',
+            'align': 'center', 'default_text': f'카피 {idx} 입력', 'line_spacing': 8,
         })
-
     image_suggestions = []
     for idx, (x, y, bw, bh) in enumerate(sorted(image_boxes, key=lambda b: (b[1], b[0]))[:6], start=1):
+        x, y, bw, bh = _clamp_box(x, y, bw, bh, w, h)
         image_suggestions.append({
-            "id": f"image_{idx}",
-            "label": f"이미지 {idx}",
-            "type": "image",
-            "x": int(x), "y": int(y), "w": int(bw), "h": int(bh),
-            "placeholder_rgb": [235, 235, 235],
+            'id': f'image_{idx}', 'label': f'이미지 {idx}', 'type': 'image',
+            'x': x, 'y': y, 'w': bw, 'h': bh, 'placeholder_rgb': [235, 235, 235],
         })
-
-    return {"text_boxes": text_suggestions, "image_slots": image_suggestions}
+    return {'text_boxes': text_suggestions, 'image_slots': image_suggestions}
 
 
 # ---------- template/render ----------
@@ -569,6 +654,9 @@ def top_header():
         .tiny-muted {{font-size: 12px; color: #777;}}
         .stTabs [data-baseweb="tab-list"] {{gap: 8px;}}
         .stTabs [data-baseweb="tab"] {{height: 48px; white-space: pre-wrap; background: #f5f5f5; border-radius: 12px; padding: 8px 18px;}}
+        .template-card {background:#fff; border:1px solid #e9e9e9; border-radius:20px; padding:14px; box-shadow:0 4px 18px rgba(0,0,0,0.04); height:100%;}
+        .template-meta {font-size:12px; color:#666; margin-top:4px;}
+        .pill {display:inline-block; background:#f2f2f2; border-radius:999px; padding:4px 10px; font-size:11px; margin-right:6px; margin-top:6px;}
         </style>
         <div class="misharp-title">{APP_TITLE}</div>
         <div class="misharp-sub">{APP_SUBTITLE}</div>
@@ -595,6 +683,8 @@ def run_creator_tab():
         example_names = [p.name for p in ex_files]
         picked_example = st.selectbox("또는 예시 디자인 선택", ["선택안함"] + example_names, index=0)
         use_auto = st.checkbox("AI로 이미지/카피 영역 자동 추천", value=True)
+        if not CV2_OK:
+            st.caption("현재 OpenCV 없이 실행 중입니다. 앱은 정상 동작하며, AI 자동 추천은 안전한 기본 분석 모드로 작동합니다.")
         note = st.text_area("템플릿 메모", height=120, placeholder="예: 상단형, 대표컷 중심, 3초 훅 강조")
 
         if uploaded_ref is not None:
@@ -741,34 +831,59 @@ def run_manage_tab():
     if not files:
         st.caption("저장된 템플릿이 없습니다.")
         return
-    for path in files:
+
+    cols = st.columns(3, gap="large")
+    for idx, path in enumerate(files):
         data = load_template(path)
-        c1, c2 = st.columns([0.72, 0.28], vertical_alignment="center")
-        with c1:
+        col = cols[idx % 3]
+        with col:
+            preview_img = None
+            ref_rel = data.get('reference_image_rel')
+            if ref_rel and (BASE_DIR / ref_rel).exists():
+                try:
+                    ref = Image.open(BASE_DIR / ref_rel).convert('RGB')
+                    preview_img = draw_guide_preview(
+                        fit_crop(ref, data.get('canvas_width', DEFAULT_CANVAS_W), data.get('canvas_height', DEFAULT_CANVAS_H)),
+                        data.get('image_slots', []),
+                        data.get('text_boxes', []),
+                        alpha=0.22,
+                    )
+                except Exception:
+                    preview_img = None
+            if preview_img is None:
+                preview_img = Image.new('RGB', (900, 1200), hex_to_rgb(data.get('background_color', '#F5F3EF')))
+
+            st.markdown('<div class="template-card">', unsafe_allow_html=True)
+            st.image(preview_img, use_container_width=True)
             st.markdown(f"**{data.get('template_name', path.stem)}**")
-            st.caption(f"{path.name} · {data.get('canvas_width')}×{data.get('canvas_height')} · 이미지 {len(data.get('image_slots', []))}개 / 카피 {len(data.get('text_boxes', []))}개")
-            if data.get("note"):
-                st.write(data["note"])
-        with c2:
-            if st.button("복제", key=f"dup_{path.name}", use_container_width=True):
+            st.markdown(
+                f"<div class='template-meta'>{path.name}<br>{data.get('canvas_width')}×{data.get('canvas_height')} · 이미지 {len(data.get('image_slots', []))}개 · 카피 {len(data.get('text_boxes', []))}개</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<span class='pill'>배경 {data.get('background_color', '#F5F3EF')}</span><span class='pill'>업데이트 {data.get('updated_at', '')[:10]}</span>",
+                unsafe_allow_html=True,
+            )
+            if data.get('note'):
+                st.caption(data['note'])
+            c1, c2 = st.columns(2)
+            if c1.button('복제', key=f'dup_{path.name}', use_container_width=True):
                 clone = dict(data)
-                clone["template_name"] = f"{data.get('template_name', path.stem)}_복제"
-                saved = save_template(clone)
-                st.success(f"복제 완료: {saved.name}")
+                clone['template_name'] = f"{data.get('template_name', path.stem)}_복제"
+                save_template(clone)
                 st.rerun()
-            if st.button("JSON 다운로드", key=f"dl_{path.name}", use_container_width=True):
-                st.download_button(
-                    label="다운로드 시작",
-                    data=json.dumps(data, ensure_ascii=False, indent=2),
-                    file_name=path.name,
-                    mime="application/json",
-                    key=f"real_dl_{path.name}",
-                )
-            if st.button("삭제", key=f"del_{path.name}", use_container_width=True):
+            c2.download_button(
+                'JSON 다운로드',
+                data=json.dumps(data, ensure_ascii=False, indent=2),
+                file_name=path.name,
+                mime='application/json',
+                key=f'dl_{path.name}',
+                use_container_width=True,
+            )
+            if st.button('삭제', key=f'del_{path.name}', use_container_width=True):
                 path.unlink(missing_ok=True)
-                st.success("삭제되었습니다.")
                 st.rerun()
-        st.markdown("---")
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 def run_use_tab():
